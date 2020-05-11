@@ -1,8 +1,9 @@
 use crate::vec2d::Vec2D;
+use std::convert::TryInto;
 
 /// An element in a possible labelling.
-#[derive(Clone, Copy, Debug)]
-struct LabelNode<T> {
+#[derive(Clone, Debug)]
+pub struct LabelNode<T> {
     /// The index into the alphabet of this label.
     ///
     /// Note that blanks are not represented by a LabelNode - this is an actual label.
@@ -11,6 +12,7 @@ struct LabelNode<T> {
     parent: i32,
     /// Extra data attached to the node
     data: T,
+    pub prefix: Vec<i32>,
 }
 
 /// A tree of labelling suffixes (partial labellings pinned to the end of the network output).
@@ -35,12 +37,13 @@ pub struct SuffixTree<T> {
     //     nodes[n].parent != ROOT_NODE => children[nodes[n].parent][nodes[n].label] == n
     //     nodes[n].parent == ROOT_NODE => root_children[nodes[n].label] == n
     //     (the parent node has a child edge back to this node labelled correctly)
-    nodes: Vec<LabelNode<T>>,
+    pub nodes: Vec<LabelNode<T>>,
     children: Vec2D<i32>,
     // We don't actually store the root node in `nodes`, because it has no associated label, data
     // or parent. In order to keep `nodes` and `children` in line (so they could be zipped), we
     // store the root's children here.
     root_children: Vec<i32>,
+    n_gram_size: i32,
 }
 
 pub struct SuffixTreeIter<'a, T> {
@@ -94,11 +97,12 @@ pub struct NodeInfo {
 }
 
 impl<T> SuffixTree<T> {
-    pub fn new(alphabet_size: usize) -> Self {
+    pub fn new(alphabet_size: usize, n_gram: i32) -> Self {
         Self {
             nodes: Vec::new(),
             children: Vec2D::new(alphabet_size),
             root_children: vec![-1; alphabet_size],
+            n_gram_size: n_gram,
         }
     }
 
@@ -126,6 +130,7 @@ impl<T> SuffixTree<T> {
         assert!(label < self.root_children.len());
         assert!(self.nodes.len() < (i32::max_value() as usize));
 
+        let mut prefix = Vec::new();
         let new_node_idx = self.nodes.len() as i32;
         if parent == ROOT_NODE {
             assert_eq!(self.root_children[label], -1);
@@ -134,11 +139,21 @@ impl<T> SuffixTree<T> {
             assert!(parent >= 0);
             assert_eq!(self.children[(parent as usize, label)], -1);
             self.children[(parent as usize, label)] = new_node_idx;
+            if self.nodes[(parent as usize)].prefix.len() < self.n_gram_size.try_into().unwrap() {
+                prefix = self.nodes[(parent as usize)].prefix.clone()
+            } else if self.nodes[(parent as usize)].prefix.len() > self.n_gram_size.try_into().unwrap(){
+                println!("failure, prefix too long")
+            } else {
+                let v1 = self.n_gram_size as usize;
+                prefix.extend(&self.nodes[(parent as usize)].prefix[1..v1]);
+            }           
+            prefix.push(label as i32);
         }
         self.nodes.push(LabelNode {
             label,
             parent,
             data,
+            prefix,
         });
         self.children.add_row_with_value(-1);
         new_node_idx
@@ -199,7 +214,7 @@ mod tests {
 
     #[test]
     fn test_tree_assembly() {
-        let mut tree = SuffixTree::new(2);
+        let mut tree = SuffixTree::new(2, 12);
         assert_eq!(tree.get_child(-1, 0), None);
         assert_eq!(tree.get_child(-1, 1), None);
         assert_eq!(tree.get_data_ref(-1), None);

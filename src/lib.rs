@@ -8,19 +8,18 @@ extern crate ndarray;
 
 extern crate test; // benchmarking
 
-use ndarray::Array2;
 use numpy::PyArray2;
 
 use pyo3::exceptions::{RuntimeError, ValueError};
 use pyo3::prelude::*;
-use pyo3::types::PySequence;
+use pyo3::types::{PySequence, PyDict, PyModule};
 use pyo3::wrap_pyfunction;
+use pyo3::PyObject;
 use std::fmt;
 
 #[cfg(feature = "fastexp")]
 mod fastexp;
 mod search;
-mod search2d;
 mod tree;
 mod vec2d;
 
@@ -29,6 +28,7 @@ pub enum SearchError {
     RanOutOfBeam,
     IncomparableValues,
     InvalidEnvelope,
+    LanguageModelError,
 }
 
 impl fmt::Display for SearchError {
@@ -41,7 +41,10 @@ impl fmt::Display for SearchError {
                 write!(f, "Failed to compare values (NaNs in input?)")
             }
             // TODO: document envelope constraints
-            SearchError::InvalidEnvelope => write!(f, "Invalid envelope values"),
+            SearchError::InvalidEnvelope => {
+                write!(f, "Invalid envelope values")
+            }
+            SearchError::LanguageModelError => write!(f, "Language model error")
         }
     }
 }
@@ -132,13 +135,16 @@ fn viterbi_search(
 ///
 /// Raises:
 ///     ValueError: The constraints on the arguments have not been met.
-#[pyfunction(beam_size = "5", beam_cut_threshold = "0.0")]
+#[pyfunction(beam_size = "5", beam_cut_threshold = "0.0", alpha = "1.0", beta = "1.0")]
 #[text_signature = "(network_output, alphabet, beam_size=5, beam_cut_threshold=0.0)"]
 fn beam_search(
     network_output: &PyArray2<f32>,
     alphabet: &PySequence,
     beam_size: usize,
     beam_cut_threshold: f32,
+    lm: &PyDict,
+    alpha: f32,
+    beta: f32,
 ) -> PyResult<(String, Vec<usize>)> {
     let alphabet = seq_to_vec(alphabet)?;
     let max_beam_cut = 1.0 / (alphabet.len() as f32);
@@ -165,6 +171,9 @@ fn beam_search(
             &alphabet,
             beam_size,
             beam_cut_threshold,
+            lm,
+            alpha,
+            beta,
         )
         .map_err(|e| RuntimeError::py_err(format!("{}", e)))
     }
@@ -204,6 +213,7 @@ fn beam_search(
 ///
 /// Raises:
 ///     ValueError: The constraints on the arguments have not been met.
+/*
 #[pyfunction(beam_size = "5", beam_cut_threshold = "0.0", envelope = "None")]
 #[text_signature = "(network_output_1, network_output_2, alphabet, envelope=None, beam_size=5, beam_cut_threshold=0.0)"]
 fn beam_search_2d(
@@ -273,6 +283,7 @@ fn beam_search_2d(
         .map_err(|e| RuntimeError::py_err(format!("{}", e)))
     }
 }
+*/
 
 /// Methods for labelling RNN results using CTC decoding.
 ///
@@ -312,9 +323,9 @@ fn beam_search_2d(
 /// or tuple allows multi-character labels to be specified. Note that the first label is not
 /// actually used by any of the functions in this module, so the value does not matter.
 #[pymodule]
-fn fast_ctc_decode(_py: Python, m: &PyModule) -> PyResult<()> {
+fn mod_fast_ctc_decode(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(beam_search))?;
-    m.add_wrapped(wrap_pyfunction!(beam_search_2d))?;
+    //m.add_wrapped(wrap_pyfunction!(beam_search_2d))?;
     m.add_wrapped(wrap_pyfunction!(viterbi_search))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())

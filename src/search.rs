@@ -1,6 +1,9 @@
 use super::SearchError;
 use crate::tree::{SuffixTree, ROOT_NODE};
 use ndarray::{ArrayBase, Data, FoldWhile, Ix2, Zip};
+use std::iter::Iterator;
+use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 /// A node in the labelling tree to build from.
 #[derive(Clone, Copy, Debug)]
@@ -13,6 +16,8 @@ struct SearchPoint {
     /// The cumulative probability of the labelling so far for paths with one or more leading
     /// blank labels.
     gap_prob: f32,
+    /// The cumulative non blank character count so far.
+    prefix_len: f32,
 }
 
 impl SearchPoint {
@@ -37,15 +42,55 @@ pub fn beam_search<D: Data<Elem = f32>>(
     alphabet: &[String],
     beam_size: usize,
     beam_cut_threshold: f32,
+    lm: &PyDict,
+    alpha: f32,
+    beta: f32,
 ) -> Result<(String, Vec<usize>), SearchError> {
     // alphabet size minus the blank label
     let alphabet_size = alphabet.len() - 1;
+    
+    let gil = Python::acquire_gil();
+    let py = gil.python();
 
-    let mut suffix_tree = SuffixTree::new(alphabet_size);
+    // Get ngram size
+    let get_ngram_size = PyModule::from_code(py, r#"
+def get_ngram_size(lm):
+    return len(list(lm.keys())[0])
+    "#, "get_ngram_size.py", "get_ngram_size");
+    let get_ngram_size = match get_ngram_size {
+        Ok(get_ngram_size) => get_ngram_size,
+        Err(_e) => return Err(SearchError::LanguageModelError),
+    };
+    let n_gram_size_func = get_ngram_size.call1("get_ngram_size",  (lm, ));
+    if let Err(_e) = get_ngram_size.call1("get_ngram_size",  (lm, )) {
+        return Err(SearchError::LanguageModelError)
+    };
+    let n_gram_size_func = match n_gram_size_func {
+        Ok(n_gram_size_func) => n_gram_size_func,
+        Err(_e) => return Err(SearchError::LanguageModelError),
+    };
+    let n_gram_size: PyResult<usize> = n_gram_size_func.extract();
+    let n_gram_size = match n_gram_size {
+        Ok(n_gram_size) => n_gram_size,
+        Err(_e) => return Err(SearchError::LanguageModelError),
+    };
+    
+    // Initialize language model probability func
+    let get_prob = PyModule::from_code(py, r#"
+def get_ngram_prob(lm, ngram):
+    return lm[ngram]
+    "#, "get_prob.py", "get_prob");
+    let get_prob = match get_prob {
+        Ok(get_prob) => get_prob,
+        Err(_e) => return Err(SearchError::LanguageModelError),
+    };
+
+    let mut suffix_tree = SuffixTree::new(alphabet_size, n_gram_size as i32);
     let mut beam = vec![SearchPoint {
         node: ROOT_NODE,
         label_prob: 0.0,
         gap_prob: 1.0,
+        prefix_len: 0.0,
     }];
     let mut next_beam = Vec::new();
 
@@ -56,6 +101,7 @@ pub fn beam_search<D: Data<Elem = f32>>(
             node,
             label_prob,
             gap_prob,
+            prefix_len,
         } in &beam
         {
             let tip_label = suffix_tree.label(node);
@@ -65,6 +111,7 @@ pub fn beam_search<D: Data<Elem = f32>>(
                     node,
                     label_prob: 0.0,
                     gap_prob: (label_prob + gap_prob) * pr[0],
+                    prefix_len: prefix_len,
                 });
             }
 
@@ -77,6 +124,7 @@ pub fn beam_search<D: Data<Elem = f32>>(
                         node,
                         label_prob: label_prob * pr_b,
                         gap_prob: 0.0,
+                        prefix_len: prefix_len,
                     });
                     let new_node_idx = suffix_tree.get_child(node, label).or_else(|| {
                         if gap_prob > 0.0 {
@@ -91,18 +139,43 @@ pub fn beam_search<D: Data<Elem = f32>>(
                             node: idx,
                             label_prob: gap_prob * pr_b,
                             gap_prob: 0.0,
+                            prefix_len: prefix_len + 1.0,
                         });
                     }
                 } else {
                     let new_node_idx = suffix_tree
                         .get_child(node, label)
                         .unwrap_or_else(|| suffix_tree.add_node(node, label, idx));
+                    
+                    if &suffix_tree.nodes[new_node_idx as usize].prefix.len() < &n_gram_size {
+                        next_beam.push(SearchPoint {
+                            node: new_node_idx,
+                            label_prob: (label_prob + gap_prob) * pr_b,
+                            gap_prob: 0.0,
+                            prefix_len: prefix_len + 1.0,
+                        });
+                    } else {
+                        let ngram: String = suffix_tree.nodes[new_node_idx as usize].prefix.iter().map(ToString::to_string).collect();
+                        let lm_prob_func = get_prob.call1("get_ngram_prob", (lm, ngram));
+                        let lm_prob_func = match lm_prob_func {
+                            Ok(lm_prob_func) => lm_prob_func,
+                            Err(_e) => return Err(SearchError::LanguageModelError),
+                        };
+                        let lm_prob: PyResult<f32> = lm_prob_func.extract();
+                        let lm_prob = match lm_prob {
+                            Ok(lm_prob) => lm_prob,
+                            Err(_e) => return Err(SearchError::LanguageModelError),
+                        };
 
-                    next_beam.push(SearchPoint {
-                        node: new_node_idx,
-                        label_prob: (label_prob + gap_prob) * pr_b,
-                        gap_prob: 0.0,
-                    });
+                        let lm_weight: f32 = lm_prob.powf(alpha);
+    
+                        next_beam.push(SearchPoint {
+                            node: new_node_idx,
+                            label_prob: (label_prob + gap_prob) * pr_b * lm_weight,
+                            gap_prob: 0.0,
+                            prefix_len: prefix_len + 1.0,
+                        });
+                    }
                 }
             }
         }
@@ -127,8 +200,8 @@ pub fn beam_search<D: Data<Elem = f32>>(
         beam.retain(|x| x.node != DELETE_MARKER);
         let mut has_nans = false;
         beam.sort_unstable_by(|a, b| {
-            (b.probability())
-                .partial_cmp(&(a.probability()))
+            (b.probability() * b.prefix_len.powf(beta))
+                .partial_cmp(&(a.probability() * a.prefix_len * a.prefix_len.powf(beta)))
                 .unwrap_or_else(|| {
                     has_nans = true;
                     std::cmp::Ordering::Equal // don't really care
