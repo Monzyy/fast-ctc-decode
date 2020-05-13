@@ -78,7 +78,7 @@ def get_ngram_size(lm):
     // Initialize language model probability func
     let get_prob = PyModule::from_code(py, r#"
 def get_ngram_prob(lm, ngram):
-    return lm[ngram]
+    return lm.get(ngram, 0.25)
     "#, "get_prob.py", "get_prob");
     let get_prob = match get_prob {
         Ok(get_prob) => get_prob,
