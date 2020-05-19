@@ -200,8 +200,8 @@ def get_ngram_prob(lm, ngram):
         beam.retain(|x| x.node != DELETE_MARKER);
         let mut has_nans = false;
         beam.sort_unstable_by(|a, b| {
-            (b.probability() * b.prefix_len.powf(beta))
-                .partial_cmp(&(a.probability() * a.prefix_len * a.prefix_len.powf(beta)))
+            (b.probability() * (b.prefix_len + 1.0).powf(beta))
+                .partial_cmp(&(a.probability() * (a.prefix_len + 1.0).powf(beta)))
                 .unwrap_or_else(|| {
                     has_nans = true;
                     std::cmp::Ordering::Equal // don't really care
