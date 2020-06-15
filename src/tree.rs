@@ -11,6 +11,8 @@ struct LabelNode<T> {
     parent: i32,
     /// Extra data attached to the node
     data: T,
+    /// Boolean that is true if the hidden vector in python is initialied,
+    hidden_ready: bool
 }
 
 /// A tree of labelling suffixes (partial labellings pinned to the end of the network output).
@@ -122,6 +124,31 @@ impl<T> SuffixTree<T> {
         }
     }
 
+    pub fn parent(&self, node: i32) -> i32 {
+        if node >= 0 {
+            let node = &self.nodes[node as usize];
+            node.parent
+        } else {
+            ROOT_NODE
+        }
+    }
+
+    pub fn is_hidden_ready(&self, node: i32) -> bool {
+        if node >= 0 {
+            let node = &self.nodes[node as usize];
+            node.hidden_ready
+        } else {
+            true
+        }
+    }
+
+    pub fn set_hidden_ready(&mut self, node: i32) {
+        if node >= 0 {
+            self.nodes[node as usize].hidden_ready = true;
+            //node.hidden_ready = true;
+        }
+    }
+
     pub fn add_node(&mut self, parent: i32, label: usize, data: T) -> i32 {
         assert!(label < self.root_children.len());
         assert!(self.nodes.len() < (i32::max_value() as usize));
@@ -139,6 +166,7 @@ impl<T> SuffixTree<T> {
             label,
             parent,
             data,
+            hidden_ready: false,
         });
         self.children.add_row_with_value(-1);
         new_node_idx

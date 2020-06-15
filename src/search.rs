@@ -1,6 +1,8 @@
 use super::SearchError;
 use crate::tree::{SuffixTree, ROOT_NODE};
 use ndarray::{ArrayBase, Data, FoldWhile, Ix2, Zip};
+use pyo3::prelude::*;
+use pyo3::types::PyTuple;
 
 /// A node in the labelling tree to build from.
 #[derive(Clone, Copy, Debug)]
@@ -13,16 +15,24 @@ struct SearchPoint {
     /// The cumulative probability of the labelling so far for paths with one or more leading
     /// blank labels.
     gap_prob: f32,
+    /// The cumulative non blank character count so far.
+    prefix_len: i32,
 }
 
 impl SearchPoint {
     /// The total probability of the labelling so far.
     ///
     /// This sums the probabilities of the paths with and without leading blank labels.
-    fn probability(&self) -> f32 {
-        self.label_prob + self.gap_prob
+    fn probability(&self, beta: f32) -> f32 {
+        (self.label_prob + self.gap_prob) * ((self.prefix_len + 1) as f32).powf(beta)
     }
 }
+
+//impl IntoPy<PyTuple> for SearchPoint {
+//    fn into_py(&self, py: Python) -> PyTuple {
+//        PyTuple::new(py, (self.node, suffix_tree.label(node), suffix_tree.parent(node)));
+//    }
+//}
 
 /// Convert probability into an ASCII encoded phred quality score between 0 and 40.
 pub fn phred(prob: f32, qscale: f32, qbias: f32) -> char {
@@ -32,11 +42,21 @@ pub fn phred(prob: f32, qscale: f32, qbias: f32) -> char {
     std::char::from_u32(q.round() as u32 + 33).unwrap()
 }
 
+//pub fn init_beam(beam: Vec<SearchPoint>, suffix_tree: SuffixTree<>, lm: PyObject, py: Python) {
+//    let parents: Vec<i32> = beam.iter().node;
+//    lm.call_method1(py, "init_search_points", (beam, ));
+//}
+
+
+// https://towardsdatascience.com/beam-search-decoding-in-ctc-trained-neural-networks-5a889a3d85a7
 pub fn beam_search<D: Data<Elem = f32>>(
     network_output: &ArrayBase<D, Ix2>,
     alphabet: &[String],
     beam_size: usize,
     beam_cut_threshold: f32,
+    lm: PyObject,
+    alpha: f32,
+    beta: f32,
 ) -> Result<(String, Vec<usize>), SearchError> {
     // alphabet size minus the blank label
     let alphabet_size = alphabet.len() - 1;
@@ -46,28 +66,68 @@ pub fn beam_search<D: Data<Elem = f32>>(
         node: ROOT_NODE,
         label_prob: 0.0,
         gap_prob: 1.0,
+        prefix_len: 0,
     }];
     let mut next_beam = Vec::new();
 
+    let mut nodes = Vec::new();
+    let mut parents = Vec::new();
+    let mut tip_labels = Vec::new();
+    let mut lm_beam_probs: Vec<Vec<f32>> = Vec::new();
+    let mut prefix_lens = Vec::new();
+    let mut last_nodes = Vec::new();
+    let mut beam_idx = 0;
+
+    let gil = Python::acquire_gil();
+    let py = gil.python();
     for (idx, pr) in network_output.outer_iter().enumerate() {
         next_beam.clear();
+
+        last_nodes = nodes.clone();
+        nodes.clear();
+        parents.clear();
+        tip_labels.clear();
+        prefix_lens.clear();
+        for i in 0..beam.len() {
+            let beam_item = beam[i];
+            nodes.push(beam_item.node);
+            parents.push(suffix_tree.parent(beam_item.node));
+            tip_labels.push(suffix_tree.label(beam_item.node));
+            prefix_lens.push(beam_item.prefix_len);
+        }
+        if nodes != last_nodes {
+            //println!("Python call");
+            lm_beam_probs = lm.call_method1(py, "init_search_points", (nodes.clone(), parents.clone(), tip_labels.clone(), prefix_lens.clone(), ))?.extract(py)?;
+        }
+
+        //println!("{}", lm_beam_probs.len());
+        //println!("{}", lm_beam_probs[0][0]);
+        beam_idx = 0;
 
         for &SearchPoint {
             node,
             label_prob,
             gap_prob,
+            prefix_len,
         } in &beam
-        {
+        {   
             let tip_label = suffix_tree.label(node);
+            //if !suffix_tree.is_hidden_ready(node) {
+            //    lm.call_method1(py, "init_search_point", (node, suffix_tree.parent(node), tip_label));
+            //    suffix_tree.set_hidden_ready(node);
+            //}
+            
             // add N to beam
             if pr[0] > beam_cut_threshold {
                 next_beam.push(SearchPoint {
                     node,
                     label_prob: 0.0,
-                    gap_prob: (label_prob + gap_prob) * pr[0],
+                    gap_prob: (label_prob + gap_prob) * pr[0], // Line 10
+                    prefix_len,
                 });
             }
-
+            
+            //println!("{}", pr.len());
             for (label, &pr_b) in pr.iter().skip(1).enumerate() {
                 if pr_b < beam_cut_threshold {
                     continue;
@@ -75,8 +135,9 @@ pub fn beam_search<D: Data<Elem = f32>>(
                 if Some(label) == tip_label {
                     next_beam.push(SearchPoint {
                         node,
-                        label_prob: label_prob * pr_b,
+                        label_prob: label_prob * pr_b, // Line 8
                         gap_prob: 0.0,
+                        prefix_len,
                     });
                     let new_node_idx = suffix_tree.get_child(node, label).or_else(|| {
                         if gap_prob > 0.0 {
@@ -85,12 +146,14 @@ pub fn beam_search<D: Data<Elem = f32>>(
                             None
                         }
                     });
-
+                    // Only allowed if last was blank
                     if let Some(idx) = new_node_idx {
                         next_beam.push(SearchPoint {
                             node: idx,
-                            label_prob: gap_prob * pr_b,
+                            label_prob: gap_prob * pr_b * lm_beam_probs[beam_idx as usize][label as usize].powf(alpha), //Line 16
+                            //label_prob: gap_prob * pr_b * lm_pr.powf(alpha), //Line 16
                             gap_prob: 0.0,
+                            prefix_len: prefix_len + 1,
                         });
                     }
                 } else {
@@ -100,11 +163,13 @@ pub fn beam_search<D: Data<Elem = f32>>(
 
                     next_beam.push(SearchPoint {
                         node: new_node_idx,
-                        label_prob: (label_prob + gap_prob) * pr_b,
+                        label_prob: (label_prob + gap_prob) * pr_b * lm_beam_probs[beam_idx as usize][label as usize].powf(alpha), //Line 18
                         gap_prob: 0.0,
+                        prefix_len: prefix_len + 1,
                     });
                 }
             }
+            beam_idx += 1;
         }
         std::mem::swap(&mut beam, &mut next_beam);
 
@@ -127,8 +192,8 @@ pub fn beam_search<D: Data<Elem = f32>>(
         beam.retain(|x| x.node != DELETE_MARKER);
         let mut has_nans = false;
         beam.sort_unstable_by(|a, b| {
-            (b.probability())
-                .partial_cmp(&(a.probability()))
+            (b.probability(beta))
+                .partial_cmp(&(a.probability(beta)))
                 .unwrap_or_else(|| {
                     has_nans = true;
                     std::cmp::Ordering::Equal // don't really care
@@ -142,7 +207,7 @@ pub fn beam_search<D: Data<Elem = f32>>(
             // we've run out of beam (probably the threshold is too high)
             return Err(SearchError::RanOutOfBeam);
         }
-        let top = beam[0].probability();
+        let top = beam[0].probability(beta);
         for mut x in &mut beam {
             x.label_prob /= top;
             x.gap_prob /= top;

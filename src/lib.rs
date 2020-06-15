@@ -24,11 +24,12 @@ mod search2d;
 mod tree;
 mod vec2d;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub enum SearchError {
     RanOutOfBeam,
     IncomparableValues,
     InvalidEnvelope,
+    LanguageModelError,
 }
 
 impl fmt::Display for SearchError {
@@ -41,12 +42,22 @@ impl fmt::Display for SearchError {
                 write!(f, "Failed to compare values (NaNs in input?)")
             }
             // TODO: document envelope constraints
-            SearchError::InvalidEnvelope => write!(f, "Invalid envelope values"),
+            SearchError::InvalidEnvelope => {
+                write!(f, "Invalid envelope values")
+            }
+            SearchError::LanguageModelError => {
+                write!(f, "Language Model Error")
+            }
         }
     }
 }
 
 impl std::error::Error for SearchError {}
+impl From<PyErr> for SearchError {
+    fn from(err: PyErr) -> Self {
+        SearchError::LanguageModelError
+    }
+}
 
 fn seq_to_vec(seq: &PySequence) -> PyResult<Vec<String>> {
     Ok(seq.tuple()?.iter().map(|x| x.to_string()).collect())
@@ -132,13 +143,16 @@ fn viterbi_search(
 ///
 /// Raises:
 ///     ValueError: The constraints on the arguments have not been met.
-#[pyfunction(beam_size = "5", beam_cut_threshold = "0.0")]
+#[pyfunction(beam_size = "5", beam_cut_threshold = "0.0", alpha = "1.0", beta = "1.0")]
 #[text_signature = "(network_output, alphabet, beam_size=5, beam_cut_threshold=0.0)"]
 fn beam_search(
     network_output: &PyArray2<f32>,
     alphabet: &PySequence,
     beam_size: usize,
     beam_cut_threshold: f32,
+    lm: PyObject,
+    alpha: f32,
+    beta: f32,
 ) -> PyResult<(String, Vec<usize>)> {
     let alphabet = seq_to_vec(alphabet)?;
     let max_beam_cut = 1.0 / (alphabet.len() as f32);
@@ -165,6 +179,9 @@ fn beam_search(
             &alphabet,
             beam_size,
             beam_cut_threshold,
+            lm,
+            alpha,
+            beta,
         )
         .map_err(|e| RuntimeError::py_err(format!("{}", e)))
     }
@@ -312,7 +329,7 @@ fn beam_search_2d(
 /// or tuple allows multi-character labels to be specified. Note that the first label is not
 /// actually used by any of the functions in this module, so the value does not matter.
 #[pymodule]
-fn fast_ctc_decode(_py: Python, m: &PyModule) -> PyResult<()> {
+fn fast_rnn_lm_ctc_decode(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(beam_search))?;
     m.add_wrapped(wrap_pyfunction!(beam_search_2d))?;
     m.add_wrapped(wrap_pyfunction!(viterbi_search))?;
